@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { emitAgentEvent, nextSeq } from "./observation/emit.ts";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -312,13 +313,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
+			const traceId = randomUUID();
 			const observationHeaders: Record<string, string> = {
-				"X-Trace-Id": randomUUID(),
+				"X-Trace-Id": traceId,
 				"X-Agent-Id": "pi",
 			};
 			if (options?.sessionId) {
 				observationHeaders["X-Session-Id"] = options.sessionId;
 			}
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: options?.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "before_provider_request",
+				source_module: "coding-agent/sdk.ts",
+				payload: {
+					model: { provider: model.provider, id: model.id, api: model.api },
+					message_count: context.messages.length,
+					tool_count: (context as { tools?: unknown[] }).tools?.length ?? 0,
+					timeout_ms: timeoutMs,
+				},
+			});
 			return streamSimple(model, context, {
 				...options,
 				apiKey: auth.apiKey,
@@ -335,6 +350,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						options?.headers,
 					),
 					...observationHeaders,
+				},
+				onPayload: async (payload, model) => {
+					emitAgentEvent({
+						trace_id: traceId,
+						session_id: options?.sessionId,
+						event_seq: nextSeq(traceId),
+						stage: "before_provider_payload",
+						source_module: "coding-agent/sdk.ts",
+						payload: { model: { provider: model.provider, id: model.id }, payload },
+					});
+					return options?.onPayload ? await options.onPayload(payload, model) : payload;
 				},
 			});
 		},
