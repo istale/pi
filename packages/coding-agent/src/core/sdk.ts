@@ -338,6 +338,68 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		lastStartMs: 0,
 	};
 
+	// Cut 6g: wrap convertToLlmWithBlockImages so each call is observable.
+	// convertToLlm fires per model call (right before streamFn), so this
+	// gives provenance for AgentMessage[] -> LLM Message[] transformation
+	// — specifically: how many messages came in vs went out (should match
+	// 1:1), which messages had images dropped by blockImages, and the role
+	// histogram on both sides.
+	const observedConvertToLlm = (messages: AgentMessage[]): Message[] => {
+		const inRoles: Record<string, number> = {};
+		for (const m of messages) {
+			const r = (m as { role?: string }).role ?? "unknown";
+			inRoles[r] = (inRoles[r] ?? 0) + 1;
+		}
+		const inImageCount = messages.reduce((acc, m) => {
+			const c = (m as { content?: unknown }).content;
+			if (Array.isArray(c)) {
+				return acc + c.filter((b) => (b as { type?: string })?.type === "image").length;
+			}
+			return acc;
+		}, 0);
+
+		const converted = convertToLlmWithBlockImages(messages);
+
+		const outRoles: Record<string, number> = {};
+		for (const m of converted) {
+			const r = (m as { role?: string }).role ?? "unknown";
+			outRoles[r] = (outRoles[r] ?? 0) + 1;
+		}
+		const outImageCount = converted.reduce((acc, m) => {
+			const c = (m as { content?: unknown }).content;
+			if (Array.isArray(c)) {
+				return acc + c.filter((b) => (b as { type?: string })?.type === "image").length;
+			}
+			return acc;
+		}, 0);
+
+		try {
+			const traceId = observationLinkRef.session?._observationLastModelCallTraceId ?? null;
+			if (traceId) {
+				emitAgentEvent({
+					trace_id: traceId,
+					session_id: observationLinkRef.session?.sessionId,
+					event_seq: nextSeq(traceId),
+					stage: "convert_to_llm",
+					source_module: "coding-agent/sdk.ts:convertToLlmWithBlockImages",
+					payload: {
+						input_message_count: messages.length,
+						output_message_count: converted.length,
+						input_role_histogram: inRoles,
+						output_role_histogram: outRoles,
+						image_count_before: inImageCount,
+						image_count_after: outImageCount,
+						images_filtered: inImageCount - outImageCount,
+						block_images_enabled: settingsManager.getBlockImages(),
+					},
+				});
+			}
+		} catch {
+			// observation must never break the agent
+		}
+		return converted;
+	};
+
 	agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -345,7 +407,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			tools: [],
 		},
-		convertToLlm: convertToLlmWithBlockImages,
+		convertToLlm: observedConvertToLlm,
 		streamFn: async (model, context, options) => {
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {
