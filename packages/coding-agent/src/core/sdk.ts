@@ -329,6 +329,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
+	// Cut 6c: mutable ref so the streamFn (set up before the AgentSession is
+	// constructed) can publish the per-model-call trace_id + start time onto
+	// the session as soon as the session is attached. message_end uses these
+	// to emit an assistant_message_finalized event with latency.
+	const observationLinkRef: { session: AgentSession | null; lastStartMs: number } = {
+		session: null,
+		lastStartMs: 0,
+	};
+
 	agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -351,6 +360,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const traceId = randomUUID();
+			observationLinkRef.lastStartMs = Date.now();
+			if (observationLinkRef.session) {
+				observationLinkRef.session._observationLastModelCallTraceId = traceId;
+			}
 			const observationHeaders: Record<string, string> = {
 				"X-Trace-Id": traceId,
 				"X-Agent-Id": "pi",
@@ -420,7 +433,41 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return runner.emitBeforeProviderRequest(payload);
 		},
-		onResponse: async (response, _model) => {
+		onResponse: async (response, model) => {
+			// Cut 6c: emit model_response_meta with HTTP status / headers /
+			// latency so the trace page can show "what came back from the
+			// upstream LLM, not just what we sent".
+			try {
+				const traceId = observationLinkRef.session?._observationLastModelCallTraceId ?? null;
+				if (traceId) {
+					const latencyMs = observationLinkRef.lastStartMs > 0 ? Date.now() - observationLinkRef.lastStartMs : null;
+					const headers = (response.headers && typeof (response.headers as { entries?: () => Iterable<[string, string]> }).entries === "function")
+						? Object.fromEntries((response.headers as unknown as Headers).entries())
+						: (response.headers as Record<string, string> | undefined) ?? null;
+					// Redact authorization header — should never appear in observation.
+					if (headers && typeof headers === "object") {
+						for (const k of Object.keys(headers)) {
+							if (k.toLowerCase() === "authorization") headers[k] = "[REDACTED]";
+						}
+					}
+					emitAgentEvent({
+						trace_id: traceId,
+						session_id: observationLinkRef.session?.sessionId,
+						event_seq: nextSeq(traceId),
+						stage: "model_response_meta",
+						source_module: "coding-agent/sdk.ts:onResponse",
+						payload: {
+							status: response.status,
+							headers,
+							latency_ms: latencyMs,
+							model_provider: model.provider,
+							model_id: model.id,
+						},
+					});
+				}
+			} catch {
+				// observation must never break the agent
+			}
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("after_provider_response")) {
 				return;
@@ -474,6 +521,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionStartEvent: options.sessionStartEvent,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
+	// Cut 6c: wire the session into the streamFn's observation closure so
+	// model_response_meta + assistant_message_finalized can correlate by
+	// per-call trace_id.
+	observationLinkRef.session = session;
 
 	return {
 		session,

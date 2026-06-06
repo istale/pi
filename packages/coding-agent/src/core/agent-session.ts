@@ -267,6 +267,12 @@ export class AgentSession {
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _observationToolStartTs: Map<string, number> = new Map();
 	private _observationCompactionTraceId: string | null = null;
+	/**
+	 * Cut 6c: per-model-call trace id, set by sdk.ts:streamFn when a model call
+	 * begins and used by the message_end handler to attribute the finalized
+	 * AssistantMessage to that call.
+	 */
+	public _observationLastModelCallTraceId: string | null = null;
 
 	/**
 	 * Cut 6b: emit a compaction observation event under a per-run synthetic trace_id.
@@ -660,6 +666,46 @@ export class AgentSession {
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "message_end") {
+			// Cut 6c: emit a finalized-message observation event tied to the
+			// last model call's trace_id so the trace page can show the
+			// stop_reason / usage / cost / content under the same round.
+			if (event.message.role === "assistant" && this._observationLastModelCallTraceId) {
+				try {
+					const traceId = this._observationLastModelCallTraceId;
+					const m = event.message;
+					emitAgentEvent({
+						trace_id: traceId,
+						session_id: this.sessionId,
+						event_seq: nextSeq(traceId),
+						stage: "assistant_message_finalized",
+						source_module: "coding-agent/agent-session.ts:message_end",
+						payload: {
+							api: m.api,
+							provider: m.provider,
+							model: m.model,
+							response_model: (m as { responseModel?: string }).responseModel,
+							response_id: (m as { responseId?: string }).responseId,
+							stop_reason: m.stopReason,
+							error_message: (m as { errorMessage?: string }).errorMessage,
+							usage: m.usage,
+							content_blocks: (m.content || []).map((c: { type: string; text?: string; name?: string }) => ({
+								type: c.type,
+								chars: typeof c.text === "string" ? c.text.length : undefined,
+								name: c.name,
+							})),
+							content_summary: {
+								text_blocks: (m.content || []).filter((c: { type: string }) => c.type === "text").length,
+								thinking_blocks: (m.content || []).filter((c: { type: string }) => c.type === "thinking").length,
+								tool_calls: (m.content || []).filter((c: { type: string }) => c.type === "toolCall").length,
+							},
+							diagnostics: (m as { diagnostics?: unknown }).diagnostics,
+							timestamp: m.timestamp,
+						},
+					});
+				} catch {
+					// observation must never break the agent
+				}
+			}
 			const extensionEvent: MessageEndEvent = {
 				type: "message_end",
 				message: event.message,
