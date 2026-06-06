@@ -906,6 +906,7 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		const previousActiveTools = this.agent.state.tools.map((t: AgentTool) => t.name);
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
@@ -920,6 +921,35 @@ export class AgentSession {
 		// Rebuild base system prompt with new tool set
 		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames, "tool_set_updated");
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
+
+		// Cut 6f: surface active-tool changes so later turns' tool_calls (or
+		// missing-tool errors) are explainable.
+		try {
+			const prev = new Set(previousActiveTools);
+			const next = new Set(validToolNames);
+			const added: string[] = [];
+			const removed: string[] = [];
+			for (const n of next) if (!prev.has(n)) added.push(n);
+			for (const n of prev) if (!next.has(n)) removed.push(n);
+			if (added.length > 0 || removed.length > 0) {
+				const traceId = `session_${this.sessionId}_lifecycle`;
+				emitAgentEvent({
+					trace_id: traceId,
+					session_id: this.sessionId,
+					event_seq: nextSeq(traceId),
+					stage: "active_tools_changed",
+					source_module: "coding-agent/agent-session.ts:setActiveToolsByName",
+					payload: {
+						before: previousActiveTools,
+						after: validToolNames,
+						added,
+						removed,
+					},
+				});
+			}
+		} catch {
+			// observation must never break the agent
+		}
 	}
 
 	/** Whether compaction or branch summarization is currently running */
@@ -1687,6 +1717,26 @@ export class AgentSession {
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(thinkingLevel);
+
+		// Cut 6f: surface mid-session model swaps so subsequent context/payload
+		// diffs make sense (different defaults / different adapter rules apply).
+		try {
+			const traceId = `session_${this.sessionId}_lifecycle`;
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: this.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "model_switched",
+				source_module: "coding-agent/agent-session.ts:setModel",
+				payload: {
+					from: previousModel ? { provider: previousModel.provider, id: previousModel.id } : null,
+					to: { provider: model.provider, id: model.id, api: model.api },
+					thinking_level: thinkingLevel,
+				},
+			});
+		} catch {
+			// observation must never break the agent
+		}
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -2748,6 +2798,23 @@ export class AgentSession {
 	}
 
 	async reload(): Promise<void> {
+		// Cut 6f: settings + resources reload — surface the trigger so any
+		// subsequent system prompt or tool-set drift is explainable.
+		try {
+			const traceId = `session_${this.sessionId}_lifecycle`;
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: this.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "session_reloaded",
+				source_module: "coding-agent/agent-session.ts:reload",
+				payload: {
+					note: "Settings + resourceLoader reloaded; following system_prompt_assembled may differ",
+				},
+			});
+		} catch {
+			// observation must never break the agent
+		}
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
