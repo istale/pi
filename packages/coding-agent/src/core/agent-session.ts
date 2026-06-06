@@ -739,6 +739,31 @@ export class AgentSession {
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "tool_execution_update") {
+			// Cut 6h: emit partial result snapshots so long-running tools
+			// (bash with streaming stdout, etc.) are observable mid-flight
+			// rather than appearing as a multi-second black box.
+			{
+				try {
+					const toolTrace = `tool_${event.toolCallId}`;
+					const startTs = this._observationToolStartTs.get(event.toolCallId);
+					const elapsedMs = startTs !== undefined ? Date.now() - startTs : undefined;
+					emitAgentEvent({
+						trace_id: toolTrace,
+						session_id: this.sessionId,
+						event_seq: nextSeq(toolTrace),
+						stage: "tool_execution_update",
+						source_module: "coding-agent/agent-session.ts",
+						payload: {
+							tool_call_id: event.toolCallId,
+							tool_name: event.toolName,
+							elapsed_ms: elapsedMs,
+							partial_result: event.partialResult,
+						},
+					});
+				} catch {
+					// observation must never break the agent
+				}
+			}
 			const extensionEvent: ToolExecutionUpdateEvent = {
 				type: "tool_execution_update",
 				toolCallId: event.toolCallId,
@@ -753,6 +778,32 @@ export class AgentSession {
 				const startTs = this._observationToolStartTs.get(event.toolCallId);
 				const durationMs = startTs !== undefined ? Date.now() - startTs : undefined;
 				this._observationToolStartTs.delete(event.toolCallId);
+
+				// Cut 6h: classify the kind of error so the UI can show the
+				// failure reason at a glance without parsing result text.
+				let errorKind: string | null = null;
+				if (event.isError) {
+					const resultText = typeof event.result === "string"
+						? event.result
+						: Array.isArray(event.result)
+							? event.result.filter((b: { type?: string; text?: string }) => b.type === "text").map((b: { text?: string }) => b.text || "").join("\n")
+							: "";
+					const lower = resultText.toLowerCase();
+					if (lower.includes("aborted") || lower.includes("cancelled") || lower.includes("canceled")) {
+						errorKind = "aborted";
+					} else if (lower.includes("not found") && lower.includes("tool")) {
+						errorKind = "tool_not_found";
+					} else if (lower.includes("blocked") || lower.includes("permission")) {
+						errorKind = "blocked";
+					} else if (lower.includes("timeout") || lower.includes("timed out")) {
+						errorKind = "timeout";
+					} else if (lower.includes("validation") || lower.includes("invalid")) {
+						errorKind = "validation_error";
+					} else {
+						errorKind = "execution_error";
+					}
+				}
+
 				emitAgentEvent({
 					trace_id: toolTrace,
 					session_id: this.sessionId,
@@ -763,6 +814,7 @@ export class AgentSession {
 						tool_call_id: event.toolCallId,
 						tool_name: event.toolName,
 						is_error: event.isError,
+						error_kind: errorKind,
 						duration_ms: durationMs,
 						result: event.result,
 					},
