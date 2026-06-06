@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { emitAgentEvent, nextSeq } from "./observation/emit.ts";
+import { emitAgentEvent, nextSeq, sessionInitTraceId } from "./observation/emit.ts";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -185,6 +185,43 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		time("resourceLoader.reload");
 	}
 
+	{
+		const sessionIdForInit = sessionManager.getSessionId();
+		const initTrace = sessionInitTraceId(sessionIdForInit);
+		const skillsResult = resourceLoader.getSkills();
+		const promptsResult = resourceLoader.getPrompts();
+		const agentsFiles = resourceLoader.getAgentsFiles();
+		emitAgentEvent({
+			trace_id: initTrace,
+			session_id: sessionIdForInit,
+			event_seq: nextSeq(initTrace),
+			stage: "resource_loaded",
+			source_module: "coding-agent/sdk.ts",
+			payload: {
+				cwd,
+				agentDir,
+				skills: skillsResult.skills.map((s) => ({
+					name: s.name,
+					description: s.description,
+					filePath: s.filePath,
+					baseDir: s.baseDir,
+					disableModelInvocation: s.disableModelInvocation,
+				})),
+				prompt_templates: promptsResult.prompts.map((p) => ({
+					name: p.name,
+					description: p.description,
+					filePath: p.filePath,
+				})),
+				agents_files: agentsFiles.agentsFiles.map((f) => ({
+					path: f.path,
+					content_length: f.content.length,
+				})),
+				skill_diagnostics: skillsResult.diagnostics,
+				prompt_diagnostics: promptsResult.diagnostics,
+			},
+		});
+	}
+
 	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
@@ -332,6 +369,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					message_count: context.messages.length,
 					tool_count: (context as { tools?: unknown[] }).tools?.length ?? 0,
 					timeout_ms: timeoutMs,
+				},
+			});
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: options?.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "context",
+				source_module: "coding-agent/sdk.ts",
+				payload: {
+					model: { provider: model.provider, id: model.id, api: model.api },
+					messages: context.messages,
+					tools: (context as { tools?: unknown[] }).tools ?? [],
 				},
 			});
 			return streamSimple(model, context, {

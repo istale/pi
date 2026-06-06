@@ -34,6 +34,7 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.ts";
+import { emitAgentEvent, nextSeq, promptTraceId } from "./observation/emit.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
@@ -987,6 +988,25 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
+
+		{
+			const promptTrace = promptTraceId();
+			const sid = this.sessionId;
+			emitAgentEvent({
+				trace_id: promptTrace,
+				session_id: sid,
+				event_seq: nextSeq(promptTrace),
+				stage: "before_agent_start",
+				source_module: "coding-agent/agent-session.ts",
+				payload: {
+					raw_user_text: text,
+					image_count: options?.images?.length ?? 0,
+					source: options?.source ?? "interactive",
+					expand_prompt_templates: expandPromptTemplates,
+					streaming_behavior: options?.streamingBehavior,
+				},
+			});
+		}
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)

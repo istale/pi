@@ -42,6 +42,16 @@ export function nextSeq(traceId: string): number {
 	return next;
 }
 
+/** Convenience for events that are session-scoped rather than per-model-call. */
+export function sessionInitTraceId(sessionId: string): string {
+	return `session_${sessionId}_init`;
+}
+
+export function promptTraceId(): string {
+	// node:crypto randomUUID requires async import in some bundlers; use Date-based fallback safe enough for observation
+	return `prompt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function emitAgentEvent(event: Omit<AgentEvent, "ts"> & { ts?: string }): void {
 	if (disabled()) return;
 	try {
