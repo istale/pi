@@ -90,7 +90,7 @@ import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader }
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
-import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
+import { type BuildSystemPromptOptions, buildSystemPromptWithComponents } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
@@ -850,7 +850,7 @@ export class AgentSession {
 		this.agent.state.tools = tools;
 
 		// Rebuild base system prompt with new tool set
-		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames, "tool_set_updated");
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
@@ -932,7 +932,7 @@ export class AgentSession {
 		return Array.from(unique);
 	}
 
-	private _rebuildSystemPrompt(toolNames: string[]): string {
+	private _rebuildSystemPrompt(toolNames: string[], reason: string = "unknown"): string {
 		const validToolNames = toolNames.filter((name) => this._toolRegistry.has(name));
 		const toolSnippets: Record<string, string> = {};
 		const promptGuidelines: string[] = [];
@@ -965,7 +965,42 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 		};
-		return buildSystemPrompt(this._baseSystemPromptOptions);
+		const result = buildSystemPromptWithComponents(this._baseSystemPromptOptions);
+
+		// Cut 6a: emit per-component provenance so the hub can explain why the
+		// system prompt contains what it contains. session_init synthetic trace_id
+		// keeps these events in the "Session 啟動設定" rollup; subsequent rebuilds
+		// land in their own synthetic trace.
+		try {
+			const traceId = `session_${this.sessionId}_sysprompt`;
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: this.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "system_prompt_assembled",
+				source_module: "coding-agent/agent-session.ts:_rebuildSystemPrompt",
+				payload: {
+					reason,
+					total_chars: result.prompt.length,
+					component_count: result.components.length,
+					components: result.components.map((c) => ({
+						id: c.id,
+						label: c.label,
+						source: c.source,
+						kind: c.kind,
+						chars: c.content.length,
+						preview: c.content.slice(0, 600),
+						content: c.content,
+					})),
+					active_tools: validToolNames,
+					custom_prompt_in_use: Boolean(loaderSystemPrompt),
+				},
+			});
+		} catch {
+			// observation must never break the agent
+		}
+
+		return result.prompt;
 	}
 
 	// =========================================================================
@@ -2177,7 +2212,7 @@ export class AgentSession {
 		};
 
 		this._resourceLoader.extendResources(extensionPaths);
-		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames(), "extension_resources_extended");
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
