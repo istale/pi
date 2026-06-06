@@ -264,6 +264,7 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
+	private _observationToolStartTs: Map<string, number> = new Map();
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -645,6 +646,22 @@ export class AgentSession {
 				this._replaceMessageInPlace(event.message, replacement);
 			}
 		} else if (event.type === "tool_execution_start") {
+			{
+				const toolTrace = `tool_${event.toolCallId}`;
+				this._observationToolStartTs.set(event.toolCallId, Date.now());
+				emitAgentEvent({
+					trace_id: toolTrace,
+					session_id: this.sessionId,
+					event_seq: nextSeq(toolTrace),
+					stage: "tool_call",
+					source_module: "coding-agent/agent-session.ts",
+					payload: {
+						tool_call_id: event.toolCallId,
+						tool_name: event.toolName,
+						args: event.args,
+					},
+				});
+			}
 			const extensionEvent: ToolExecutionStartEvent = {
 				type: "tool_execution_start",
 				toolCallId: event.toolCallId,
@@ -662,6 +679,26 @@ export class AgentSession {
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "tool_execution_end") {
+			{
+				const toolTrace = `tool_${event.toolCallId}`;
+				const startTs = this._observationToolStartTs.get(event.toolCallId);
+				const durationMs = startTs !== undefined ? Date.now() - startTs : undefined;
+				this._observationToolStartTs.delete(event.toolCallId);
+				emitAgentEvent({
+					trace_id: toolTrace,
+					session_id: this.sessionId,
+					event_seq: nextSeq(toolTrace),
+					stage: "tool_result",
+					source_module: "coding-agent/agent-session.ts",
+					payload: {
+						tool_call_id: event.toolCallId,
+						tool_name: event.toolName,
+						is_error: event.isError,
+						duration_ms: durationMs,
+						result: event.result,
+					},
+				});
+			}
 			const extensionEvent: ToolExecutionEndEvent = {
 				type: "tool_execution_end",
 				toolCallId: event.toolCallId,
