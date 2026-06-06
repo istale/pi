@@ -266,6 +266,28 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _observationToolStartTs: Map<string, number> = new Map();
+	private _observationCompactionTraceId: string | null = null;
+
+	/**
+	 * Cut 6b: emit a compaction observation event under a per-run synthetic trace_id.
+	 * Failures are swallowed so observation never breaks compaction.
+	 */
+	private _emitCompactionEvent(stage: string, payload: Record<string, unknown>): void {
+		try {
+			if (!this._observationCompactionTraceId) return;
+			const traceId = this._observationCompactionTraceId;
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: this.sessionId,
+				event_seq: nextSeq(traceId),
+				stage,
+				source_module: "coding-agent/agent-session.ts:_runAutoCompaction or compact",
+				payload,
+			});
+		} catch {
+			// never throw from observation
+		}
+	}
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -1740,6 +1762,12 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
+		this._observationCompactionTraceId = `compaction_${this.sessionId}_${Date.now().toString(36)}`;
+		this._emitCompactionEvent("compaction_started", {
+			reason: "manual",
+			kind: "manual",
+			custom_instructions: customInstructions ?? null,
+		});
 		this._emit({ type: "compaction_start", reason: "manual" });
 
 		try {
@@ -1756,11 +1784,27 @@ export class AgentSession {
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
+				this._emitCompactionEvent("compaction_skipped", {
+					reason: "preparation_undefined",
+					note: lastEntry?.type === "compaction" ? "already_compacted" : "session_too_small",
+				});
+				this._observationCompactionTraceId = null;
 				if (lastEntry?.type === "compaction") {
 					throw new Error("Already compacted");
 				}
 				throw new Error("Nothing to compact (session too small)");
 			}
+			this._emitCompactionEvent("compaction_prepared", {
+				first_kept_entry_id: preparation.firstKeptEntryId,
+				messages_to_summarize_count: preparation.messagesToSummarize.length,
+				turn_prefix_messages_count: preparation.turnPrefixMessages.length,
+				is_split_turn: preparation.isSplitTurn,
+				tokens_before: preparation.tokensBefore,
+				previous_summary_chars: preparation.previousSummary?.length ?? 0,
+				file_ops_count: (preparation.fileOps?.read.size ?? 0) + (preparation.fileOps?.written.size ?? 0) + (preparation.fileOps?.edited.size ?? 0),
+				reserve_tokens: preparation.settings.reserveTokens,
+				custom_instructions: customInstructions ?? null,
+			});
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -1812,6 +1856,15 @@ export class AgentSession {
 				tokensBefore = result.tokensBefore;
 				details = result.details;
 			}
+
+			this._emitCompactionEvent("compaction_completed", {
+				summary,
+				summary_chars: summary.length,
+				first_kept_entry_id: firstKeptEntryId,
+				tokens_before: tokensBefore,
+				from_extension: fromExtension,
+			});
+			this._observationCompactionTraceId = null;
 
 			if (this._compactionAbortController.signal.aborted) {
 				throw new Error("Compaction cancelled");
@@ -1967,7 +2020,33 @@ export class AgentSession {
 		} else {
 			contextTokens = calculateContextTokens(assistantMessage.usage);
 		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		const trigger = shouldCompact(contextTokens, contextWindow, settings);
+		// Cut 6b: surface the threshold check itself so the timeline shows
+		// "checked but not triggered" — otherwise compaction is completely
+		// invisible until it fires, which makes "why didn't it compact?"
+		// debugging impossible.
+		try {
+			const checkTrace = `compaction_check_${this.sessionId}_${Date.now().toString(36)}`;
+			emitAgentEvent({
+				trace_id: checkTrace,
+				session_id: this.sessionId,
+				event_seq: nextSeq(checkTrace),
+				stage: "compaction_check",
+				source_module: "coding-agent/agent-session.ts:_runCompactionCheckOnAssistantUsage",
+				payload: {
+					trigger,
+					context_tokens: contextTokens,
+					context_window: contextWindow,
+					reserve_tokens: settings.reserveTokens,
+					enabled: settings.enabled,
+					threshold: contextWindow - settings.reserveTokens,
+					margin: contextWindow - settings.reserveTokens - contextTokens,
+				},
+			});
+		} catch {
+			// never throw from observation
+		}
+		if (trigger) {
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -1978,6 +2057,10 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
+
+		// Cut 6b: open a compaction trace_id so prepared/completed events group.
+		this._observationCompactionTraceId = `compaction_${this.sessionId}_${Date.now().toString(36)}`;
+		this._emitCompactionEvent("compaction_started", { reason, kind: "auto", will_retry: willRetry });
 
 		this._emit({ type: "compaction_start", reason });
 		this._autoCompactionAbortController = new AbortController();
@@ -2018,6 +2101,11 @@ export class AgentSession {
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
+				this._emitCompactionEvent("compaction_skipped", {
+					reason: "preparation_undefined",
+					note: "prepareCompaction returned undefined; nothing to compact or already compacted",
+				});
+				this._observationCompactionTraceId = null;
 				this._emit({
 					type: "compaction_end",
 					reason,
@@ -2027,6 +2115,17 @@ export class AgentSession {
 				});
 				return false;
 			}
+
+			this._emitCompactionEvent("compaction_prepared", {
+				first_kept_entry_id: preparation.firstKeptEntryId,
+				messages_to_summarize_count: preparation.messagesToSummarize.length,
+				turn_prefix_messages_count: preparation.turnPrefixMessages.length,
+				is_split_turn: preparation.isSplitTurn,
+				tokens_before: preparation.tokensBefore,
+				previous_summary_chars: preparation.previousSummary?.length ?? 0,
+				file_ops_count: (preparation.fileOps?.read.size ?? 0) + (preparation.fileOps?.written.size ?? 0) + (preparation.fileOps?.edited.size ?? 0),
+				reserve_tokens: preparation.settings.reserveTokens,
+			});
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -2085,6 +2184,15 @@ export class AgentSession {
 				tokensBefore = compactResult.tokensBefore;
 				details = compactResult.details;
 			}
+
+			this._emitCompactionEvent("compaction_completed", {
+				summary,
+				summary_chars: summary.length,
+				first_kept_entry_id: firstKeptEntryId,
+				tokens_before: tokensBefore,
+				from_extension: fromExtension,
+			});
+			this._observationCompactionTraceId = null;
 
 			if (this._autoCompactionAbortController.signal.aborted) {
 				this._emit({
