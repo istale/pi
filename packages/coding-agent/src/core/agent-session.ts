@@ -34,6 +34,7 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.ts";
+import { buildConstraintPreamble, loadPinnedConstraints } from "./observation/constraints.ts";
 import { emitAgentEvent, nextSeq, promptTraceId } from "./observation/emit.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -1026,6 +1027,13 @@ export class AgentSession {
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
 
+		const constraints = loadPinnedConstraints();
+		const preamble = buildConstraintPreamble(constraints);
+		const originalText = text;
+		if (preamble.length > 0) {
+			text = preamble + text;
+		}
+
 		{
 			const promptTrace = promptTraceId();
 			const sid = this.sessionId;
@@ -1036,7 +1044,10 @@ export class AgentSession {
 				stage: "before_agent_start",
 				source_module: "coding-agent/agent-session.ts",
 				payload: {
-					raw_user_text: text,
+					raw_user_text: originalText,
+					applied_constraints: constraints,
+					constraint_count: constraints.length,
+					effective_text: preamble.length > 0 ? text : undefined,
 					image_count: options?.images?.length ?? 0,
 					source: options?.source ?? "interactive",
 					expand_prompt_templates: expandPromptTemplates,
