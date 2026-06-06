@@ -1137,13 +1137,16 @@ export class AgentSession {
 			text = preamble + text;
 		}
 
+		// Cut 6e: open ONE per-prompt observation trace so before_agent_start and
+		// all subsequent input transforms (extension input hook, slash command,
+		// skill expansion, prompt template expansion, queued steer/followUp)
+		// share a trace_id and stack together as a single User Input round.
+		const inputTrace = promptTraceId();
 		{
-			const promptTrace = promptTraceId();
-			const sid = this.sessionId;
 			emitAgentEvent({
-				trace_id: promptTrace,
-				session_id: sid,
-				event_seq: nextSeq(promptTrace),
+				trace_id: inputTrace,
+				session_id: this.sessionId,
+				event_seq: nextSeq(inputTrace),
 				stage: "before_agent_start",
 				source_module: "coding-agent/agent-session.ts",
 				payload: {
@@ -1158,6 +1161,20 @@ export class AgentSession {
 				},
 			});
 		}
+		const emitInputEvent = (stage: string, payload: Record<string, unknown>): void => {
+			try {
+				emitAgentEvent({
+					trace_id: inputTrace,
+					session_id: this.sessionId,
+					event_seq: nextSeq(inputTrace),
+					stage,
+					source_module: "coding-agent/agent-session.ts:prompt",
+					payload,
+				});
+			} catch {
+				// observation must never break the agent
+			}
+		};
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -1165,7 +1182,11 @@ export class AgentSession {
 			if (expandPromptTemplates && text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
-					// Extension command executed, no prompt to send
+					emitInputEvent("slash_command_handled", {
+						text,
+						handled: true,
+						note: "Extension command intercepted the input — no LLM call dispatched",
+					});
 					preflightResult?.(true);
 					return;
 				}
@@ -1182,10 +1203,23 @@ export class AgentSession {
 					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
 				if (inputResult.action === "handled") {
+					emitInputEvent("extension_input_handled", {
+						action: "handled",
+						note: "An extension input hook fully absorbed the input — no LLM call dispatched",
+					});
 					preflightResult?.(true);
 					return;
 				}
 				if (inputResult.action === "transform") {
+					emitInputEvent("extension_input_transformed", {
+						action: "transform",
+						before_text: currentText,
+						after_text: inputResult.text,
+						chars_before: currentText.length,
+						chars_after: inputResult.text.length,
+						image_count_before: currentImages?.length ?? 0,
+						image_count_after: (inputResult.images ?? currentImages)?.length ?? 0,
+					});
 					currentText = inputResult.text;
 					currentImages = inputResult.images ?? currentImages;
 				}
@@ -1194,8 +1228,26 @@ export class AgentSession {
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
 			if (expandPromptTemplates) {
+				const textBeforeSkill = expandedText;
 				expandedText = this._expandSkillCommand(expandedText);
+				if (expandedText !== textBeforeSkill) {
+					emitInputEvent("skill_command_expanded", {
+						before_text: textBeforeSkill,
+						after_text: expandedText,
+						chars_before: textBeforeSkill.length,
+						chars_after: expandedText.length,
+					});
+				}
+				const textBeforeTemplate = expandedText;
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+				if (expandedText !== textBeforeTemplate) {
+					emitInputEvent("prompt_template_expanded", {
+						before_text: textBeforeTemplate,
+						after_text: expandedText,
+						chars_before: textBeforeTemplate.length,
+						chars_after: expandedText.length,
+					});
+				}
 			}
 
 			// If streaming, queue via steer() or followUp() based on option
@@ -1206,8 +1258,20 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
+					emitInputEvent("queued_followup", {
+						text: expandedText,
+						chars: expandedText.length,
+						image_count: currentImages?.length ?? 0,
+						note: "agent is already streaming — text queued for after current model call ends",
+					});
 					await this._queueFollowUp(expandedText, currentImages);
 				} else {
+					emitInputEvent("queued_steer", {
+						text: expandedText,
+						chars: expandedText.length,
+						image_count: currentImages?.length ?? 0,
+						note: "agent is streaming — text queued as steering message for the next turn",
+					});
 					await this._queueSteer(expandedText, currentImages);
 				}
 				preflightResult?.(true);
