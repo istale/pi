@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
 	type AssistantMessage,
 	type ImageContent,
@@ -377,9 +378,15 @@ export class AgentHarness<
 		return async (model, context, streamOptions) => {
 			const turnState = getTurnState();
 			const auth = await this.getApiKeyAndHeaders?.(model);
+			const traceId = randomUUID();
+			const observationHeaders: Record<string, string> = {
+				"X-Trace-Id": traceId,
+				"X-Session-Id": turnState.sessionId,
+				"X-Agent-Id": "pi",
+			};
 			const snapshotOptions: AgentHarnessStreamOptions = {
 				...turnState.streamOptions,
-				headers: mergeHeaders(turnState.streamOptions.headers, auth?.headers),
+				headers: mergeHeaders(turnState.streamOptions.headers, auth?.headers, observationHeaders),
 			};
 			const requestOptions = await this.emitBeforeProviderRequest(model, turnState.sessionId, snapshotOptions);
 			return streamSimple(model, context, {

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
@@ -311,6 +312,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
+			const observationHeaders: Record<string, string> = {
+				"X-Trace-Id": randomUUID(),
+				"X-Agent-Id": "pi",
+			};
+			if (options?.sessionId) {
+				observationHeaders["X-Session-Id"] = options.sessionId;
+			}
 			return streamSimple(model, context, {
 				...options,
 				apiKey: auth.apiKey,
@@ -318,13 +326,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				websocketConnectTimeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				headers: mergeProviderAttributionHeaders(
-					model,
-					settingsManager,
-					options?.sessionId,
-					auth.headers,
-					options?.headers,
-				),
+				headers: {
+					...mergeProviderAttributionHeaders(
+						model,
+						settingsManager,
+						options?.sessionId,
+						auth.headers,
+						options?.headers,
+					),
+					...observationHeaders,
+				},
 			});
 		},
 		onPayload: async (payload, _model) => {
