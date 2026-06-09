@@ -1216,6 +1216,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			supportsReasoningEffort: false,
 			maxTokensField: "max_tokens",
 			supportsStrictMode: false,
+			thinkingFormat: "deepseek",
 		};
 
 		for (const { key, provider, baseUrl } of moonshotVariants) {
