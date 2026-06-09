@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { emitAgentEvent, nextSeq, sessionInitTraceId } from "./observation/emit.ts";
+import { applyOverlayToMessages, buildAnnotationMessage, loadOverlay } from "./observation/overlay.ts";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -333,9 +334,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// constructed) can publish the per-model-call trace_id + start time onto
 	// the session as soon as the session is attached. message_end uses these
 	// to emit an assistant_message_finalized event with latency.
-	const observationLinkRef: { session: AgentSession | null; lastStartMs: number } = {
+	//
+	// Overlay extension: convertToLlm runs FIRST (it applies hidden tombstones
+	// to AgentMessages), then sets lastOverlays here. streamFn reads it next
+	// to augment context.systemPrompt with the annotation. Cleared after each
+	// streamFn invocation so a stale overlay never leaks across turns.
+	const observationLinkRef: {
+		session: AgentSession | null;
+		lastStartMs: number;
+		lastOverlays: import("./observation/overlay.ts").MessageOverlay[];
+		lastOverlayAnnotation: string | null;
+	} = {
 		session: null,
 		lastStartMs: 0,
+		lastOverlays: [],
+		lastOverlayAnnotation: null,
 	};
 
 	// Cut 6g: wrap convertToLlmWithBlockImages so each call is observable.
@@ -358,7 +371,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			return acc;
 		}, 0);
 
-		const converted = convertToLlmWithBlockImages(messages);
+		// Overlay application: read hub-side overlay snapshot for this session
+		// and replace hidden message content with tombstones BEFORE convert.
+		// Annotation goes into context.systemPrompt at streamFn — Message
+		// union here doesn't have a 'system' role; the provider adapter
+		// reads systemPrompt out of band.
+		const sessionIdForOverlay = observationLinkRef.session?.sessionId;
+		const overlays = sessionIdForOverlay ? loadOverlay(sessionIdForOverlay) : [];
+		const messagesAfterOverlay = applyOverlayToMessages(messages, overlays);
+		observationLinkRef.lastOverlays = overlays;
+		observationLinkRef.lastOverlayAnnotation = overlays.length > 0 ? buildAnnotationMessage(overlays) : null;
+
+		const converted = convertToLlmWithBlockImages(messagesAfterOverlay);
 
 		const outRoles: Record<string, number> = {};
 		for (const m of converted) {
@@ -393,6 +417,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						block_images_enabled: settingsManager.getBlockImages(),
 					},
 				});
+
 			}
 		} catch {
 			// observation must never break the agent
@@ -458,7 +483,50 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					tools: (context as { tools?: unknown[] }).tools ?? [],
 				},
 			});
-			return streamSimple(model, context, {
+
+			// Overlay annotation merge: convertToLlm has already applied
+			// hidden tombstones; now we splice the annotation into
+			// context.systemPrompt so the model sees it as the second system
+			// message (after the original system prompt).
+			const overlaysForTurn = observationLinkRef.lastOverlays;
+			const annotation = observationLinkRef.lastOverlayAnnotation;
+			let augmentedContext = context;
+			if (overlaysForTurn.length > 0 && annotation) {
+				const existingSystemPrompt = context.systemPrompt ?? "";
+				const separator = existingSystemPrompt.length > 0 ? "\n\n---\n\n" : "";
+				augmentedContext = {
+					...context,
+					systemPrompt: `${existingSystemPrompt}${separator}${annotation}`,
+				};
+				try {
+					emitAgentEvent({
+						trace_id: traceId,
+						session_id: options?.sessionId,
+						event_seq: nextSeq(traceId),
+						stage: "overlay_applied",
+						source_module: "coding-agent/sdk.ts:streamFn",
+						payload: {
+							session_id: options?.sessionId,
+							overlay_count: overlaysForTurn.length,
+							hidden_count: overlaysForTurn.filter((o) => o.mark === "hidden").length,
+							background_count: overlaysForTurn.filter((o) => o.mark === "background").length,
+							stale_count: overlaysForTurn.filter((o) => o.mark === "stale").length,
+							applied_indices: overlaysForTurn.map((o) => o.index),
+							annotation_chars: annotation.length,
+							annotation_preview: annotation.slice(0, 1200),
+							system_prompt_chars_before: existingSystemPrompt.length,
+							system_prompt_chars_after: augmentedContext.systemPrompt!.length,
+						},
+					});
+				} catch {
+					// never break the agent
+				}
+			}
+			// Reset so the next turn's overlay decision is independent.
+			observationLinkRef.lastOverlays = [];
+			observationLinkRef.lastOverlayAnnotation = null;
+
+			return streamSimple(model, augmentedContext, {
 				...options,
 				apiKey: auth.apiKey,
 				timeoutMs,

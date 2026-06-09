@@ -80,7 +80,9 @@ describe("loadOverlay", () => {
 		const overlays = loadOverlay("sess-a");
 		expect(overlays).toHaveLength(2);
 		expect(overlays[0]).toEqual({ index: 1, mark: "stale", note: "overruled" });
-		expect(overlays[1]).toEqual({ index: 3, mark: "hidden" });
+		// loadOverlay normalises missing/undefined note to null so downstream
+		// code can rely on the field always being present.
+		expect(overlays[1]).toEqual({ index: 3, mark: "hidden", note: null });
 	});
 
 	it("returns empty array when snapshot is malformed JSON", () => {
