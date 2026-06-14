@@ -1,5 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { emitAgentEvent, nextSeq, sessionInitTraceId } from "./observation/emit.ts";
+import { applyOverlayToMessages, buildAnnotationMessage, loadOverlay } from "./observation/overlay.ts";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -183,6 +186,43 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		time("resourceLoader.reload");
 	}
 
+	{
+		const sessionIdForInit = sessionManager.getSessionId();
+		const initTrace = sessionInitTraceId(sessionIdForInit);
+		const skillsResult = resourceLoader.getSkills();
+		const promptsResult = resourceLoader.getPrompts();
+		const agentsFiles = resourceLoader.getAgentsFiles();
+		emitAgentEvent({
+			trace_id: initTrace,
+			session_id: sessionIdForInit,
+			event_seq: nextSeq(initTrace),
+			stage: "resource_loaded",
+			source_module: "coding-agent/sdk.ts",
+			payload: {
+				cwd,
+				agentDir,
+				skills: skillsResult.skills.map((s) => ({
+					name: s.name,
+					description: s.description,
+					filePath: s.filePath,
+					baseDir: s.baseDir,
+					disableModelInvocation: s.disableModelInvocation,
+				})),
+				prompt_templates: promptsResult.prompts.map((p) => ({
+					name: p.name,
+					description: p.description,
+					filePath: p.filePath,
+				})),
+				agents_files: agentsFiles.agentsFiles.map((f) => ({
+					path: f.path,
+					content_length: f.content.length,
+				})),
+				skill_diagnostics: skillsResult.diagnostics,
+				prompt_diagnostics: promptsResult.diagnostics,
+			},
+		});
+	}
+
 	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
@@ -290,6 +330,101 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
+	// Cut 6c: mutable ref so the streamFn (set up before the AgentSession is
+	// constructed) can publish the per-model-call trace_id + start time onto
+	// the session as soon as the session is attached. message_end uses these
+	// to emit an assistant_message_finalized event with latency.
+	//
+	// Overlay extension: convertToLlm runs FIRST (it applies hidden tombstones
+	// to AgentMessages), then sets lastOverlays here. streamFn reads it next
+	// to augment context.systemPrompt with the annotation. Cleared after each
+	// streamFn invocation so a stale overlay never leaks across turns.
+	const observationLinkRef: {
+		session: AgentSession | null;
+		lastStartMs: number;
+		lastOverlays: import("./observation/overlay.ts").MessageOverlay[];
+		lastOverlayAnnotation: string | null;
+	} = {
+		session: null,
+		lastStartMs: 0,
+		lastOverlays: [],
+		lastOverlayAnnotation: null,
+	};
+
+	// Cut 6g: wrap convertToLlmWithBlockImages so each call is observable.
+	// convertToLlm fires per model call (right before streamFn), so this
+	// gives provenance for AgentMessage[] -> LLM Message[] transformation
+	// — specifically: how many messages came in vs went out (should match
+	// 1:1), which messages had images dropped by blockImages, and the role
+	// histogram on both sides.
+	const observedConvertToLlm = (messages: AgentMessage[]): Message[] => {
+		const inRoles: Record<string, number> = {};
+		for (const m of messages) {
+			const r = (m as { role?: string }).role ?? "unknown";
+			inRoles[r] = (inRoles[r] ?? 0) + 1;
+		}
+		const inImageCount = messages.reduce((acc, m) => {
+			const c = (m as { content?: unknown }).content;
+			if (Array.isArray(c)) {
+				return acc + c.filter((b) => (b as { type?: string })?.type === "image").length;
+			}
+			return acc;
+		}, 0);
+
+		// Overlay application: read hub-side overlay snapshot for this session
+		// and replace hidden message content with tombstones BEFORE convert.
+		// Annotation goes into context.systemPrompt at streamFn — Message
+		// union here doesn't have a 'system' role; the provider adapter
+		// reads systemPrompt out of band.
+		const sessionIdForOverlay = observationLinkRef.session?.sessionId;
+		const overlays = sessionIdForOverlay ? loadOverlay(sessionIdForOverlay) : [];
+		const messagesAfterOverlay = applyOverlayToMessages(messages, overlays);
+		observationLinkRef.lastOverlays = overlays;
+		observationLinkRef.lastOverlayAnnotation = overlays.length > 0 ? buildAnnotationMessage(overlays) : null;
+
+		const converted = convertToLlmWithBlockImages(messagesAfterOverlay);
+
+		const outRoles: Record<string, number> = {};
+		for (const m of converted) {
+			const r = (m as { role?: string }).role ?? "unknown";
+			outRoles[r] = (outRoles[r] ?? 0) + 1;
+		}
+		const outImageCount = converted.reduce((acc, m) => {
+			const c = (m as { content?: unknown }).content;
+			if (Array.isArray(c)) {
+				return acc + c.filter((b) => (b as { type?: string })?.type === "image").length;
+			}
+			return acc;
+		}, 0);
+
+		try {
+			const traceId = observationLinkRef.session?._observationLastModelCallTraceId ?? null;
+			if (traceId) {
+				emitAgentEvent({
+					trace_id: traceId,
+					session_id: observationLinkRef.session?.sessionId,
+					event_seq: nextSeq(traceId),
+					stage: "convert_to_llm",
+					source_module: "coding-agent/sdk.ts:convertToLlmWithBlockImages",
+					payload: {
+						input_message_count: messages.length,
+						output_message_count: converted.length,
+						input_role_histogram: inRoles,
+						output_role_histogram: outRoles,
+						image_count_before: inImageCount,
+						image_count_after: outImageCount,
+						images_filtered: inImageCount - outImageCount,
+						block_images_enabled: settingsManager.getBlockImages(),
+					},
+				});
+
+			}
+		} catch {
+			// observation must never break the agent
+		}
+		return converted;
+	};
+
 	agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -297,7 +432,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			tools: [],
 		},
-		convertToLlm: convertToLlmWithBlockImages,
+		convertToLlm: observedConvertToLlm,
 		streamFn: async (model, context, options) => {
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok) {
@@ -311,20 +446,114 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
-			return streamSimple(model, context, {
+			const traceId = randomUUID();
+			observationLinkRef.lastStartMs = Date.now();
+			if (observationLinkRef.session) {
+				observationLinkRef.session._observationLastModelCallTraceId = traceId;
+			}
+			const observationHeaders: Record<string, string> = {
+				"X-Trace-Id": traceId,
+				"X-Agent-Id": "pi",
+			};
+			if (options?.sessionId) {
+				observationHeaders["X-Session-Id"] = options.sessionId;
+			}
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: options?.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "before_provider_request",
+				source_module: "coding-agent/sdk.ts",
+				payload: {
+					model: { provider: model.provider, id: model.id, api: model.api },
+					message_count: context.messages.length,
+					tool_count: (context as { tools?: unknown[] }).tools?.length ?? 0,
+					timeout_ms: timeoutMs,
+				},
+			});
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: options?.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "context",
+				source_module: "coding-agent/sdk.ts",
+				payload: {
+					model: { provider: model.provider, id: model.id, api: model.api },
+					messages: context.messages,
+					tools: (context as { tools?: unknown[] }).tools ?? [],
+				},
+			});
+
+			// Overlay annotation merge: convertToLlm has already applied
+			// hidden tombstones; now we splice the annotation into
+			// context.systemPrompt so the model sees it as the second system
+			// message (after the original system prompt).
+			const overlaysForTurn = observationLinkRef.lastOverlays;
+			const annotation = observationLinkRef.lastOverlayAnnotation;
+			let augmentedContext = context;
+			if (overlaysForTurn.length > 0 && annotation) {
+				const existingSystemPrompt = context.systemPrompt ?? "";
+				const separator = existingSystemPrompt.length > 0 ? "\n\n---\n\n" : "";
+				augmentedContext = {
+					...context,
+					systemPrompt: `${existingSystemPrompt}${separator}${annotation}`,
+				};
+				try {
+					emitAgentEvent({
+						trace_id: traceId,
+						session_id: options?.sessionId,
+						event_seq: nextSeq(traceId),
+						stage: "overlay_applied",
+						source_module: "coding-agent/sdk.ts:streamFn",
+						payload: {
+							session_id: options?.sessionId,
+							overlay_count: overlaysForTurn.length,
+							hidden_count: overlaysForTurn.filter((o) => o.mark === "hidden").length,
+							background_count: overlaysForTurn.filter((o) => o.mark === "background").length,
+							stale_count: overlaysForTurn.filter((o) => o.mark === "stale").length,
+							applied_indices: overlaysForTurn.map((o) => o.index),
+							annotation_chars: annotation.length,
+							annotation_preview: annotation.slice(0, 1200),
+							system_prompt_chars_before: existingSystemPrompt.length,
+							system_prompt_chars_after: augmentedContext.systemPrompt!.length,
+						},
+					});
+				} catch {
+					// never break the agent
+				}
+			}
+			// Reset so the next turn's overlay decision is independent.
+			observationLinkRef.lastOverlays = [];
+			observationLinkRef.lastOverlayAnnotation = null;
+
+			return streamSimple(model, augmentedContext, {
 				...options,
 				apiKey: auth.apiKey,
 				timeoutMs,
 				websocketConnectTimeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				headers: mergeProviderAttributionHeaders(
-					model,
-					settingsManager,
-					options?.sessionId,
-					auth.headers,
-					options?.headers,
-				),
+				headers: {
+					...mergeProviderAttributionHeaders(
+						model,
+						settingsManager,
+						options?.sessionId,
+						auth.headers,
+						options?.headers,
+					),
+					...observationHeaders,
+				},
+				onPayload: async (payload, model) => {
+					emitAgentEvent({
+						trace_id: traceId,
+						session_id: options?.sessionId,
+						event_seq: nextSeq(traceId),
+						stage: "before_provider_payload",
+						source_module: "coding-agent/sdk.ts",
+						payload: { model: { provider: model.provider, id: model.id }, payload },
+					});
+					return options?.onPayload ? await options.onPayload(payload, model) : payload;
+				},
 			});
 		},
 		onPayload: async (payload, _model) => {
@@ -334,7 +563,41 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return runner.emitBeforeProviderRequest(payload);
 		},
-		onResponse: async (response, _model) => {
+		onResponse: async (response, model) => {
+			// Cut 6c: emit model_response_meta with HTTP status / headers /
+			// latency so the trace page can show "what came back from the
+			// upstream LLM, not just what we sent".
+			try {
+				const traceId = observationLinkRef.session?._observationLastModelCallTraceId ?? null;
+				if (traceId) {
+					const latencyMs = observationLinkRef.lastStartMs > 0 ? Date.now() - observationLinkRef.lastStartMs : null;
+					const headers = (response.headers && typeof (response.headers as { entries?: () => Iterable<[string, string]> }).entries === "function")
+						? Object.fromEntries((response.headers as unknown as Headers).entries())
+						: (response.headers as Record<string, string> | undefined) ?? null;
+					// Redact authorization header — should never appear in observation.
+					if (headers && typeof headers === "object") {
+						for (const k of Object.keys(headers)) {
+							if (k.toLowerCase() === "authorization") headers[k] = "[REDACTED]";
+						}
+					}
+					emitAgentEvent({
+						trace_id: traceId,
+						session_id: observationLinkRef.session?.sessionId,
+						event_seq: nextSeq(traceId),
+						stage: "model_response_meta",
+						source_module: "coding-agent/sdk.ts:onResponse",
+						payload: {
+							status: response.status,
+							headers,
+							latency_ms: latencyMs,
+							model_provider: model.provider,
+							model_id: model.id,
+						},
+					});
+				}
+			} catch {
+				// observation must never break the agent
+			}
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("after_provider_response")) {
 				return;
@@ -388,6 +651,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionStartEvent: options.sessionStartEvent,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
+	// Cut 6c: wire the session into the streamFn's observation closure so
+	// model_response_meta + assistant_message_finalized can correlate by
+	// per-call trace_id.
+	observationLinkRef.session = session;
 
 	return {
 		session,

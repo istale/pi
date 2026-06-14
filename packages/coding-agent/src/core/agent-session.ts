@@ -34,6 +34,8 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.ts";
+import { buildConstraintPreamble, loadPinnedConstraints } from "./observation/constraints.ts";
+import { emitAgentEvent, nextSeq, promptTraceId } from "./observation/emit.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
@@ -88,7 +90,7 @@ import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader }
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
-import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
+import { type BuildSystemPromptOptions, buildSystemPromptWithComponents } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
@@ -263,6 +265,35 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
+	private _observationToolStartTs: Map<string, number> = new Map();
+	private _observationCompactionTraceId: string | null = null;
+	/**
+	 * Cut 6c: per-model-call trace id, set by sdk.ts:streamFn when a model call
+	 * begins and used by the message_end handler to attribute the finalized
+	 * AssistantMessage to that call.
+	 */
+	public _observationLastModelCallTraceId: string | null = null;
+
+	/**
+	 * Cut 6b: emit a compaction observation event under a per-run synthetic trace_id.
+	 * Failures are swallowed so observation never breaks compaction.
+	 */
+	private _emitCompactionEvent(stage: string, payload: Record<string, unknown>): void {
+		try {
+			if (!this._observationCompactionTraceId) return;
+			const traceId = this._observationCompactionTraceId;
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: this.sessionId,
+				event_seq: nextSeq(traceId),
+				stage,
+				source_module: "coding-agent/agent-session.ts:_runAutoCompaction or compact",
+				payload,
+			});
+		} catch {
+			// never throw from observation
+		}
+	}
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -635,6 +666,46 @@ export class AgentSession {
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "message_end") {
+			// Cut 6c: emit a finalized-message observation event tied to the
+			// last model call's trace_id so the trace page can show the
+			// stop_reason / usage / cost / content under the same round.
+			if (event.message.role === "assistant" && this._observationLastModelCallTraceId) {
+				try {
+					const traceId = this._observationLastModelCallTraceId;
+					const m = event.message;
+					emitAgentEvent({
+						trace_id: traceId,
+						session_id: this.sessionId,
+						event_seq: nextSeq(traceId),
+						stage: "assistant_message_finalized",
+						source_module: "coding-agent/agent-session.ts:message_end",
+						payload: {
+							api: m.api,
+							provider: m.provider,
+							model: m.model,
+							response_model: (m as { responseModel?: string }).responseModel,
+							response_id: (m as { responseId?: string }).responseId,
+							stop_reason: m.stopReason,
+							error_message: (m as { errorMessage?: string }).errorMessage,
+							usage: m.usage,
+							content_blocks: (m.content || []).map((c: { type: string; text?: string; name?: string }) => ({
+								type: c.type,
+								chars: typeof c.text === "string" ? c.text.length : undefined,
+								name: c.name,
+							})),
+							content_summary: {
+								text_blocks: (m.content || []).filter((c: { type: string }) => c.type === "text").length,
+								thinking_blocks: (m.content || []).filter((c: { type: string }) => c.type === "thinking").length,
+								tool_calls: (m.content || []).filter((c: { type: string }) => c.type === "toolCall").length,
+							},
+							diagnostics: (m as { diagnostics?: unknown }).diagnostics,
+							timestamp: m.timestamp,
+						},
+					});
+				} catch {
+					// observation must never break the agent
+				}
+			}
 			const extensionEvent: MessageEndEvent = {
 				type: "message_end",
 				message: event.message,
@@ -644,6 +715,22 @@ export class AgentSession {
 				this._replaceMessageInPlace(event.message, replacement);
 			}
 		} else if (event.type === "tool_execution_start") {
+			{
+				const toolTrace = `tool_${event.toolCallId}`;
+				this._observationToolStartTs.set(event.toolCallId, Date.now());
+				emitAgentEvent({
+					trace_id: toolTrace,
+					session_id: this.sessionId,
+					event_seq: nextSeq(toolTrace),
+					stage: "tool_call",
+					source_module: "coding-agent/agent-session.ts",
+					payload: {
+						tool_call_id: event.toolCallId,
+						tool_name: event.toolName,
+						args: event.args,
+					},
+				});
+			}
 			const extensionEvent: ToolExecutionStartEvent = {
 				type: "tool_execution_start",
 				toolCallId: event.toolCallId,
@@ -652,6 +739,31 @@ export class AgentSession {
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "tool_execution_update") {
+			// Cut 6h: emit partial result snapshots so long-running tools
+			// (bash with streaming stdout, etc.) are observable mid-flight
+			// rather than appearing as a multi-second black box.
+			{
+				try {
+					const toolTrace = `tool_${event.toolCallId}`;
+					const startTs = this._observationToolStartTs.get(event.toolCallId);
+					const elapsedMs = startTs !== undefined ? Date.now() - startTs : undefined;
+					emitAgentEvent({
+						trace_id: toolTrace,
+						session_id: this.sessionId,
+						event_seq: nextSeq(toolTrace),
+						stage: "tool_execution_update",
+						source_module: "coding-agent/agent-session.ts",
+						payload: {
+							tool_call_id: event.toolCallId,
+							tool_name: event.toolName,
+							elapsed_ms: elapsedMs,
+							partial_result: event.partialResult,
+						},
+					});
+				} catch {
+					// observation must never break the agent
+				}
+			}
 			const extensionEvent: ToolExecutionUpdateEvent = {
 				type: "tool_execution_update",
 				toolCallId: event.toolCallId,
@@ -661,6 +773,53 @@ export class AgentSession {
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		} else if (event.type === "tool_execution_end") {
+			{
+				const toolTrace = `tool_${event.toolCallId}`;
+				const startTs = this._observationToolStartTs.get(event.toolCallId);
+				const durationMs = startTs !== undefined ? Date.now() - startTs : undefined;
+				this._observationToolStartTs.delete(event.toolCallId);
+
+				// Cut 6h: classify the kind of error so the UI can show the
+				// failure reason at a glance without parsing result text.
+				let errorKind: string | null = null;
+				if (event.isError) {
+					const resultText = typeof event.result === "string"
+						? event.result
+						: Array.isArray(event.result)
+							? event.result.filter((b: { type?: string; text?: string }) => b.type === "text").map((b: { text?: string }) => b.text || "").join("\n")
+							: "";
+					const lower = resultText.toLowerCase();
+					if (lower.includes("aborted") || lower.includes("cancelled") || lower.includes("canceled")) {
+						errorKind = "aborted";
+					} else if (lower.includes("not found") && lower.includes("tool")) {
+						errorKind = "tool_not_found";
+					} else if (lower.includes("blocked") || lower.includes("permission")) {
+						errorKind = "blocked";
+					} else if (lower.includes("timeout") || lower.includes("timed out")) {
+						errorKind = "timeout";
+					} else if (lower.includes("validation") || lower.includes("invalid")) {
+						errorKind = "validation_error";
+					} else {
+						errorKind = "execution_error";
+					}
+				}
+
+				emitAgentEvent({
+					trace_id: toolTrace,
+					session_id: this.sessionId,
+					event_seq: nextSeq(toolTrace),
+					stage: "tool_result",
+					source_module: "coding-agent/agent-session.ts",
+					payload: {
+						tool_call_id: event.toolCallId,
+						tool_name: event.toolName,
+						is_error: event.isError,
+						error_kind: errorKind,
+						duration_ms: durationMs,
+						result: event.result,
+					},
+				});
+			}
 			const extensionEvent: ToolExecutionEndEvent = {
 				type: "tool_execution_end",
 				toolCallId: event.toolCallId,
@@ -799,6 +958,7 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		const previousActiveTools = this.agent.state.tools.map((t: AgentTool) => t.name);
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
@@ -811,8 +971,37 @@ export class AgentSession {
 		this.agent.state.tools = tools;
 
 		// Rebuild base system prompt with new tool set
-		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames, "tool_set_updated");
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
+
+		// Cut 6f: surface active-tool changes so later turns' tool_calls (or
+		// missing-tool errors) are explainable.
+		try {
+			const prev = new Set(previousActiveTools);
+			const next = new Set(validToolNames);
+			const added: string[] = [];
+			const removed: string[] = [];
+			for (const n of next) if (!prev.has(n)) added.push(n);
+			for (const n of prev) if (!next.has(n)) removed.push(n);
+			if (added.length > 0 || removed.length > 0) {
+				const traceId = `session_${this.sessionId}_lifecycle`;
+				emitAgentEvent({
+					trace_id: traceId,
+					session_id: this.sessionId,
+					event_seq: nextSeq(traceId),
+					stage: "active_tools_changed",
+					source_module: "coding-agent/agent-session.ts:setActiveToolsByName",
+					payload: {
+						before: previousActiveTools,
+						after: validToolNames,
+						added,
+						removed,
+					},
+				});
+			}
+		} catch {
+			// observation must never break the agent
+		}
 	}
 
 	/** Whether compaction or branch summarization is currently running */
@@ -893,7 +1082,7 @@ export class AgentSession {
 		return Array.from(unique);
 	}
 
-	private _rebuildSystemPrompt(toolNames: string[]): string {
+	private _rebuildSystemPrompt(toolNames: string[], reason: string = "unknown"): string {
 		const validToolNames = toolNames.filter((name) => this._toolRegistry.has(name));
 		const toolSnippets: Record<string, string> = {};
 		const promptGuidelines: string[] = [];
@@ -926,7 +1115,42 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 		};
-		return buildSystemPrompt(this._baseSystemPromptOptions);
+		const result = buildSystemPromptWithComponents(this._baseSystemPromptOptions);
+
+		// Cut 6a: emit per-component provenance so the hub can explain why the
+		// system prompt contains what it contains. session_init synthetic trace_id
+		// keeps these events in the "Session 啟動設定" rollup; subsequent rebuilds
+		// land in their own synthetic trace.
+		try {
+			const traceId = `session_${this.sessionId}_sysprompt`;
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: this.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "system_prompt_assembled",
+				source_module: "coding-agent/agent-session.ts:_rebuildSystemPrompt",
+				payload: {
+					reason,
+					total_chars: result.prompt.length,
+					component_count: result.components.length,
+					components: result.components.map((c) => ({
+						id: c.id,
+						label: c.label,
+						source: c.source,
+						kind: c.kind,
+						chars: c.content.length,
+						preview: c.content.slice(0, 600),
+						content: c.content,
+					})),
+					active_tools: validToolNames,
+					custom_prompt_in_use: Boolean(loaderSystemPrompt),
+				},
+			});
+		} catch {
+			// observation must never break the agent
+		}
+
+		return result.prompt;
 	}
 
 	// =========================================================================
@@ -988,13 +1212,63 @@ export class AgentSession {
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
 
+		const constraints = loadPinnedConstraints();
+		const preamble = buildConstraintPreamble(constraints);
+		const originalText = text;
+		if (preamble.length > 0) {
+			text = preamble + text;
+		}
+
+		// Cut 6e: open ONE per-prompt observation trace so before_agent_start and
+		// all subsequent input transforms (extension input hook, slash command,
+		// skill expansion, prompt template expansion, queued steer/followUp)
+		// share a trace_id and stack together as a single User Input round.
+		const inputTrace = promptTraceId();
+		{
+			emitAgentEvent({
+				trace_id: inputTrace,
+				session_id: this.sessionId,
+				event_seq: nextSeq(inputTrace),
+				stage: "before_agent_start",
+				source_module: "coding-agent/agent-session.ts",
+				payload: {
+					raw_user_text: originalText,
+					applied_constraints: constraints,
+					constraint_count: constraints.length,
+					effective_text: preamble.length > 0 ? text : undefined,
+					image_count: options?.images?.length ?? 0,
+					source: options?.source ?? "interactive",
+					expand_prompt_templates: expandPromptTemplates,
+					streaming_behavior: options?.streamingBehavior,
+				},
+			});
+		}
+		const emitInputEvent = (stage: string, payload: Record<string, unknown>): void => {
+			try {
+				emitAgentEvent({
+					trace_id: inputTrace,
+					session_id: this.sessionId,
+					event_seq: nextSeq(inputTrace),
+					stage,
+					source_module: "coding-agent/agent-session.ts:prompt",
+					payload,
+				});
+			} catch {
+				// observation must never break the agent
+			}
+		};
+
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
-					// Extension command executed, no prompt to send
+					emitInputEvent("slash_command_handled", {
+						text,
+						handled: true,
+						note: "Extension command intercepted the input — no LLM call dispatched",
+					});
 					preflightResult?.(true);
 					return;
 				}
@@ -1011,10 +1285,23 @@ export class AgentSession {
 					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
 				if (inputResult.action === "handled") {
+					emitInputEvent("extension_input_handled", {
+						action: "handled",
+						note: "An extension input hook fully absorbed the input — no LLM call dispatched",
+					});
 					preflightResult?.(true);
 					return;
 				}
 				if (inputResult.action === "transform") {
+					emitInputEvent("extension_input_transformed", {
+						action: "transform",
+						before_text: currentText,
+						after_text: inputResult.text,
+						chars_before: currentText.length,
+						chars_after: inputResult.text.length,
+						image_count_before: currentImages?.length ?? 0,
+						image_count_after: (inputResult.images ?? currentImages)?.length ?? 0,
+					});
 					currentText = inputResult.text;
 					currentImages = inputResult.images ?? currentImages;
 				}
@@ -1023,8 +1310,26 @@ export class AgentSession {
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
 			if (expandPromptTemplates) {
+				const textBeforeSkill = expandedText;
 				expandedText = this._expandSkillCommand(expandedText);
+				if (expandedText !== textBeforeSkill) {
+					emitInputEvent("skill_command_expanded", {
+						before_text: textBeforeSkill,
+						after_text: expandedText,
+						chars_before: textBeforeSkill.length,
+						chars_after: expandedText.length,
+					});
+				}
+				const textBeforeTemplate = expandedText;
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+				if (expandedText !== textBeforeTemplate) {
+					emitInputEvent("prompt_template_expanded", {
+						before_text: textBeforeTemplate,
+						after_text: expandedText,
+						chars_before: textBeforeTemplate.length,
+						chars_after: expandedText.length,
+					});
+				}
 			}
 
 			// If streaming, queue via steer() or followUp() based on option
@@ -1035,8 +1340,20 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
+					emitInputEvent("queued_followup", {
+						text: expandedText,
+						chars: expandedText.length,
+						image_count: currentImages?.length ?? 0,
+						note: "agent is already streaming — text queued for after current model call ends",
+					});
 					await this._queueFollowUp(expandedText, currentImages);
 				} else {
+					emitInputEvent("queued_steer", {
+						text: expandedText,
+						chars: expandedText.length,
+						image_count: currentImages?.length ?? 0,
+						note: "agent is streaming — text queued as steering message for the next turn",
+					});
 					await this._queueSteer(expandedText, currentImages);
 				}
 				preflightResult?.(true);
@@ -1453,6 +1770,26 @@ export class AgentSession {
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(thinkingLevel);
 
+		// Cut 6f: surface mid-session model swaps so subsequent context/payload
+		// diffs make sense (different defaults / different adapter rules apply).
+		try {
+			const traceId = `session_${this.sessionId}_lifecycle`;
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: this.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "model_switched",
+				source_module: "coding-agent/agent-session.ts:setModel",
+				payload: {
+					from: previousModel ? { provider: previousModel.provider, id: previousModel.id } : null,
+					to: { provider: model.provider, id: model.id, api: model.api },
+					thinking_level: thinkingLevel,
+				},
+			});
+		} catch {
+			// observation must never break the agent
+		}
+
 		await this._emitModelSelect(model, previousModel, "set");
 	}
 
@@ -1637,6 +1974,12 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
+		this._observationCompactionTraceId = `compaction_${this.sessionId}_${Date.now().toString(36)}`;
+		this._emitCompactionEvent("compaction_started", {
+			reason: "manual",
+			kind: "manual",
+			custom_instructions: customInstructions ?? null,
+		});
 		this._emit({ type: "compaction_start", reason: "manual" });
 
 		try {
@@ -1653,11 +1996,27 @@ export class AgentSession {
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
+				this._emitCompactionEvent("compaction_skipped", {
+					reason: "preparation_undefined",
+					note: lastEntry?.type === "compaction" ? "already_compacted" : "session_too_small",
+				});
+				this._observationCompactionTraceId = null;
 				if (lastEntry?.type === "compaction") {
 					throw new Error("Already compacted");
 				}
 				throw new Error("Nothing to compact (session too small)");
 			}
+			this._emitCompactionEvent("compaction_prepared", {
+				first_kept_entry_id: preparation.firstKeptEntryId,
+				messages_to_summarize_count: preparation.messagesToSummarize.length,
+				turn_prefix_messages_count: preparation.turnPrefixMessages.length,
+				is_split_turn: preparation.isSplitTurn,
+				tokens_before: preparation.tokensBefore,
+				previous_summary_chars: preparation.previousSummary?.length ?? 0,
+				file_ops_count: (preparation.fileOps?.read.size ?? 0) + (preparation.fileOps?.written.size ?? 0) + (preparation.fileOps?.edited.size ?? 0),
+				reserve_tokens: preparation.settings.reserveTokens,
+				custom_instructions: customInstructions ?? null,
+			});
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -1709,6 +2068,15 @@ export class AgentSession {
 				tokensBefore = result.tokensBefore;
 				details = result.details;
 			}
+
+			this._emitCompactionEvent("compaction_completed", {
+				summary,
+				summary_chars: summary.length,
+				first_kept_entry_id: firstKeptEntryId,
+				tokens_before: tokensBefore,
+				from_extension: fromExtension,
+			});
+			this._observationCompactionTraceId = null;
 
 			if (this._compactionAbortController.signal.aborted) {
 				throw new Error("Compaction cancelled");
@@ -1864,7 +2232,33 @@ export class AgentSession {
 		} else {
 			contextTokens = calculateContextTokens(assistantMessage.usage);
 		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		const trigger = shouldCompact(contextTokens, contextWindow, settings);
+		// Cut 6b: surface the threshold check itself so the timeline shows
+		// "checked but not triggered" — otherwise compaction is completely
+		// invisible until it fires, which makes "why didn't it compact?"
+		// debugging impossible.
+		try {
+			const checkTrace = `compaction_check_${this.sessionId}_${Date.now().toString(36)}`;
+			emitAgentEvent({
+				trace_id: checkTrace,
+				session_id: this.sessionId,
+				event_seq: nextSeq(checkTrace),
+				stage: "compaction_check",
+				source_module: "coding-agent/agent-session.ts:_runCompactionCheckOnAssistantUsage",
+				payload: {
+					trigger,
+					context_tokens: contextTokens,
+					context_window: contextWindow,
+					reserve_tokens: settings.reserveTokens,
+					enabled: settings.enabled,
+					threshold: contextWindow - settings.reserveTokens,
+					margin: contextWindow - settings.reserveTokens - contextTokens,
+				},
+			});
+		} catch {
+			// never throw from observation
+		}
+		if (trigger) {
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -1875,6 +2269,10 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
+
+		// Cut 6b: open a compaction trace_id so prepared/completed events group.
+		this._observationCompactionTraceId = `compaction_${this.sessionId}_${Date.now().toString(36)}`;
+		this._emitCompactionEvent("compaction_started", { reason, kind: "auto", will_retry: willRetry });
 
 		this._emit({ type: "compaction_start", reason });
 		this._autoCompactionAbortController = new AbortController();
@@ -1915,6 +2313,11 @@ export class AgentSession {
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
+				this._emitCompactionEvent("compaction_skipped", {
+					reason: "preparation_undefined",
+					note: "prepareCompaction returned undefined; nothing to compact or already compacted",
+				});
+				this._observationCompactionTraceId = null;
 				this._emit({
 					type: "compaction_end",
 					reason,
@@ -1924,6 +2327,17 @@ export class AgentSession {
 				});
 				return false;
 			}
+
+			this._emitCompactionEvent("compaction_prepared", {
+				first_kept_entry_id: preparation.firstKeptEntryId,
+				messages_to_summarize_count: preparation.messagesToSummarize.length,
+				turn_prefix_messages_count: preparation.turnPrefixMessages.length,
+				is_split_turn: preparation.isSplitTurn,
+				tokens_before: preparation.tokensBefore,
+				previous_summary_chars: preparation.previousSummary?.length ?? 0,
+				file_ops_count: (preparation.fileOps?.read.size ?? 0) + (preparation.fileOps?.written.size ?? 0) + (preparation.fileOps?.edited.size ?? 0),
+				reserve_tokens: preparation.settings.reserveTokens,
+			});
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -1982,6 +2396,15 @@ export class AgentSession {
 				tokensBefore = compactResult.tokensBefore;
 				details = compactResult.details;
 			}
+
+			this._emitCompactionEvent("compaction_completed", {
+				summary,
+				summary_chars: summary.length,
+				first_kept_entry_id: firstKeptEntryId,
+				tokens_before: tokensBefore,
+				from_extension: fromExtension,
+			});
+			this._observationCompactionTraceId = null;
 
 			if (this._autoCompactionAbortController.signal.aborted) {
 				this._emit({
@@ -2109,7 +2532,7 @@ export class AgentSession {
 		};
 
 		this._resourceLoader.extendResources(extensionPaths);
-		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames(), "extension_resources_extended");
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
@@ -2427,6 +2850,23 @@ export class AgentSession {
 	}
 
 	async reload(): Promise<void> {
+		// Cut 6f: settings + resources reload — surface the trigger so any
+		// subsequent system prompt or tool-set drift is explainable.
+		try {
+			const traceId = `session_${this.sessionId}_lifecycle`;
+			emitAgentEvent({
+				trace_id: traceId,
+				session_id: this.sessionId,
+				event_seq: nextSeq(traceId),
+				stage: "session_reloaded",
+				source_module: "coding-agent/agent-session.ts:reload",
+				payload: {
+					note: "Settings + resourceLoader reloaded; following system_prompt_assembled may differ",
+				},
+			});
+		} catch {
+			// observation must never break the agent
+		}
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
